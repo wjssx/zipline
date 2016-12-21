@@ -28,6 +28,7 @@ from numpy import (
 from numpy.testing import assert_almost_equal, assert_array_equal
 from pandas import (
     DataFrame,
+    Panel,
     DatetimeIndex,
     Timestamp,
     Timedelta,
@@ -42,11 +43,12 @@ from zipline.data.minute_bars import (
     BcolzMinuteBarReader,
     BcolzMinuteOverlappingData,
     US_EQUITIES_MINUTES_PER_DAY,
-    BcolzMinuteWriterColumnMismatch
+    BcolzMinuteWriterColumnMismatch,
+    H5MinuteBarUpdateWriter,
+    H5MinuteBarUpdateReader,
 )
 
 from zipline.testing.fixtures import (
-    WithAssetFinder,
     WithInstanceTmpDir,
     WithTradingCalendars,
     ZiplineTestCase,
@@ -60,11 +62,8 @@ TEST_CALENDAR_STOP = Timestamp('2015-12-31', tz='UTC')
 
 
 class BcolzMinuteBarTestCase(WithTradingCalendars,
-                             WithAssetFinder,
                              WithInstanceTmpDir,
                              ZiplineTestCase):
-
-    ASSET_FINDER_EQUITY_SIDS = 1, 2
 
     @classmethod
     def init_class_fixtures(cls):
@@ -1045,63 +1044,54 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
             self.test_calendar_start)
         self.assertEqual(self.reader.last_available_dt, last_close)
 
-    def test_early_market_close(self):
-        # Date to test is 2015-11-30 9:31
-        # Early close is 2015-11-27 18:00
-        friday_after_tday = Timestamp('2015-11-27', tz='UTC')
-        friday_after_tday_close = self.market_closes[friday_after_tday]
-
-        before_early_close = friday_after_tday_close - timedelta(minutes=8)
-        after_early_close = friday_after_tday_close + timedelta(minutes=8)
-
-        monday_after_tday = Timestamp('2015-11-30', tz='UTC')
-        minute = self.market_opens[monday_after_tday]
-
-        # Test condition where there is data written after the market
-        # close (ideally, this should not occur in datasets, but guards
-        # against consumers of the minute bar writer, which do not filter
-        # out after close minutes.
-        minutes = [
-            before_early_close,
-            after_early_close,
-            minute,
-        ]
-        sid = 1
-        data = DataFrame(
+    def test_minute_updates(self):
+        """
+        Test minute updates.
+        """
+        start_minute = self.market_opens[TEST_CALENDAR_START]
+        minutes = [start_minute,
+                   start_minute + Timedelta('1 min'),
+                   start_minute + Timedelta('2 min')]
+        sids = [1, 2]
+        data_1 = DataFrame(
             data={
-                'open': [10.0, 11.0, nan],
-                'high': [20.0, 21.0, nan],
-                'low': [30.0, 31.0, nan],
-                'close': [40.0, 41.0, nan],
-                'volume': [50, 51, 0]
+                'open': [15.0, nan, 15.1],
+                'high': [17.0, nan, 17.1],
+                'low': [11.0, nan, 11.1],
+                'close': [14.0, nan, 14.1],
+                'volume': [1000, 0, 1001]
             },
-            index=[minutes])
-        self.writer.write_sid(sid, data)
+            index=minutes)
 
-        open_price = self.reader.get_value(sid, minute, 'open')
+        data_2 = DataFrame(
+            data={
+                'open': [25.0, nan, 25.1],
+                'high': [27.0, nan, 27.1],
+                'low': [21.0, nan, 21.1],
+                'close': [24.0, nan, 24.1],
+                'volume': [2000, 0, 2001]
+            },
+            index=minutes)
 
-        assert_almost_equal(nan, open_price)
+        panel = Panel.from_dict({1: data_1, 2: data_2})
+        update_path = self.instance_tmpdir.getpath('updates.h5')
+        update_writer = H5MinuteBarUpdateWriter(update_path)
+        update_writer.write(panel)
 
-        high_price = self.reader.get_value(sid, minute, 'high')
+        update_reader = H5MinuteBarUpdateReader(update_path)
+        self.writer.write(update_reader.read())
 
-        assert_almost_equal(nan, high_price)
+        # Refresh the reader since truncate update the metadata.
+        reader = BcolzMinuteBarReader(self.dest)
 
-        low_price = self.reader.get_value(sid, minute, 'low')
+        columns = ['open', 'high', 'low', 'close', 'volume']
+        sids = [sids[0], sids[1]]
+        arrays = list(map(transpose, reader.load_raw_arrays(
+            columns, minutes[0], minutes[-1], sids,
+        )))
 
-        assert_almost_equal(nan, low_price)
+        data = {sids[0]: data_1, sids[1]: data_2}
 
-        close_price = self.reader.get_value(sid, minute, 'close')
-
-        assert_almost_equal(nan, close_price)
-
-        volume = self.reader.get_value(sid, minute, 'volume')
-
-        self.assertEquals(0, volume)
-
-        asset = self.asset_finder.retrieve_asset(sid)
-        last_traded_dt = self.reader.get_last_traded_dt(asset, minute)
-
-        self.assertEquals(last_traded_dt, before_early_close,
-                          "The last traded dt should be before the early "
-                          "close, even when data is written between the early "
-                          "close and the next open.")
+        for i, col in enumerate(columns):
+            for j, sid in enumerate(sids):
+                assert_almost_equal(data[sid][col], arrays[i][j])

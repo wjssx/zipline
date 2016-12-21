@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from abc import ABCMeta, abstractmethod
 import json
 import os
 from glob import glob
@@ -24,6 +25,9 @@ from intervaltree import IntervalTree
 import logbook
 import numpy as np
 import pandas as pd
+from pandas import HDFStore
+import tables
+from six import with_metaclass
 from toolz import keymap, valmap
 
 from zipline.data._minute_bar_internal import (
@@ -1242,3 +1246,45 @@ class BcolzMinuteBarReader(MinuteBarReader):
 
             results.append(out)
         return results
+
+
+class MinuteBarUpdateReader(with_metaclass(ABCMeta, object)):
+
+    @abstractmethod
+    def read(self):
+        raise NotImplementedError
+
+
+class H5MinuteBarUpdateWriter(object):
+
+    FORMAT_VERSION = 0
+
+    _COMPLEVEL = 5
+    _COMPLIB = 'zlib'
+
+    def __init__(self, path, complevel=None, complib=None):
+        self._complevel = complevel if complevel \
+            is not None else self._COMPLEVEL
+        self._complib = complib if complib \
+            is not None else self._COMPLIB
+        self._path = path
+
+    def write(self, frames):
+        _store = HDFStore(
+            self._path, 'w', complevel=self._COMPLEVEL, complib=self._COMPLIB)
+        panel = pd.Panel.from_dict(dict(frames))
+        panel.to_hdf(_store, 'updates')
+        _store.close()
+        h5file = tables.open_file(self._path, mode='r+')
+        metadata = h5file.create_group('/', 'metadata')
+        metadata._v_attrs['version'] = 0
+        h5file.close()
+
+
+class H5MinuteBarUpdateReader(MinuteBarUpdateReader):
+
+    def __init__(self, path):
+        self._panel = pd.read_hdf(path)
+
+    def read(self):
+        return self._panel.iteritems()
